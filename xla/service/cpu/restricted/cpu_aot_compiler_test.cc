@@ -11,6 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <gmock/gmock.h>
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -22,13 +24,16 @@ limitations under the License.
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "llvm-c/Target.h"
 #include "llvm/ADT/StringMap.h"  // IWYU pragma: keep
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 #include "tsl/platform/casts.h"
 #include "xla/backends/cpu/codegen/cpu_features.h"
+#include "xla/backends/cpu/codegen/ir_compiler.h"
 #include "xla/backends/cpu/target_machine_options.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -51,6 +56,12 @@ limitations under the License.
 namespace xla {
 namespace cpu {
 namespace {
+
+using ::testing::AnyOf;
+using ::testing::Contains;
+using ::testing::Each;
+using ::testing::IsEmpty;
+using ::testing::Not;
 
 using CpuAotCompilerTest = HloTestBaseLegacy;
 
@@ -97,6 +108,9 @@ ENTRY e {
       /*entry_point_name=*/"entry",
       /*relocation_model=*/CpuAotCompilationOptions::RelocationModel::BigPic);
   aot_options->set_executor(stream_exec);
+  aot_options->set_sanitize_memory(IrCompiler::HostMsanEnabled());
+  aot_options->set_sanitize_memory_track_origins(
+      IrCompiler::HostMsanTrackOrigins());
 
   auto test = [this, &compiler, aot_options = std::move(aot_options)](
                   absl::string_view test_name, absl::string_view hlo, int input,
@@ -110,6 +124,9 @@ ENTRY e {
 
     ASSERT_OK_AND_ASSIGN(std::string serialized_aot_result,
                          aot_results[0]->SerializeAsString());
+    if (IrCompiler::HostMsanEnabled()) {
+      EXPECT_TRUE(absl::StrContains(serialized_aot_result, "__msan_"));
+    }
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<CompiledModule> aot_result,
         compiler->LoadAotCompilationResult(serialized_aot_result));
@@ -256,9 +273,108 @@ ENTRY main {
   std::vector<absl::string_view> aot_result_features = absl::StrSplit(
       cpu_aot_result->proto().target_machine_options().features(), ',');
 
-  EXPECT_EQ(aot_result_features.size(), 2);
+  ASSERT_GE(aot_result_features.size(), 2);
   EXPECT_EQ(aot_result_features[0], "+foo-feature");
   EXPECT_EQ(aot_result_features[1], "-bar-feature");
+  std::vector<absl::string_view> extra_features(aot_result_features.begin() + 2,
+                                                aot_result_features.end());
+  if (IrCompiler::HostMsanEnabled()) {
+    // Workarounds for LLVM bugs; see IrCompiler::MsanTargetFeatureOverrides.
+    EXPECT_THAT(extra_features, Each(AnyOf("-avx2", "-sve")));
+  } else {
+    EXPECT_THAT(extra_features, IsEmpty());
+  }
+}
+
+// Compiles with msan for targets that need LLVM workarounds. Does not run the
+// generated code, so it runs in all builds.
+TEST_F(CpuAotCompilerTest, AheadOfTimeCompilationWithMsan) {
+  LLVMInitializeX86Target();
+  LLVMInitializeX86TargetInfo();
+  LLVMInitializeX86TargetMC();
+  LLVMInitializeX86AsmPrinter();
+  LLVMInitializeAArch64Target();
+  LLVMInitializeAArch64TargetInfo();
+  LLVMInitializeAArch64TargetMC();
+  LLVMInitializeAArch64AsmPrinter();
+
+  constexpr absl::string_view kHlo = R"(
+HloModule module
+
+ENTRY main {
+  p0 = f32[64] parameter(0)
+  p1 = f32[64] parameter(1)
+  ROOT add = f32[64] add(p0, p1)
+})";
+
+  struct TestCase {
+    absl::string_view triple;
+    absl::string_view cpu;
+    absl::string_view expected_override;  // Empty if none.
+  };
+  constexpr TestCase kTestCases[] = {
+      {"x86_64-unknown-linux-gnu", "haswell", "-avx2"},
+      {"x86_64-unknown-linux-gnu", "znver3", "-avx2"},
+      {"x86_64-unknown-linux-gnu", "sapphirerapids", ""},
+      {"aarch64-unknown-linux-gnu", "neoverse-v2", "-sve"},
+  };
+
+  Compiler* compiler = backend().compiler();
+  ASSERT_NE(compiler, nullptr);
+
+  for (const TestCase& test_case : kTestCases) {
+    SCOPED_TRACE(absl::StrCat(test_case.triple, " ", test_case.cpu));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                         ParseAndReturnVerifiedModule(kHlo));
+    CpuAotCompilationOptions aot_options(
+        std::string(test_case.triple), std::string(test_case.cpu),
+        /*features=*/"", /*entry_point_name=*/"entry",
+        CpuAotCompilationOptions::RelocationModel::BigPic);
+    aot_options.set_sanitize_memory(true);
+
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::unique_ptr<CompiledModule>> aot_results,
+        compiler->CompileAheadOfTime(std::move(module), aot_options));
+    ASSERT_EQ(aot_results.size(), 1);
+
+    ASSERT_OK_AND_ASSIGN(std::string serialized,
+                         aot_results[0]->SerializeAsString());
+    EXPECT_TRUE(absl::StrContains(serialized, "__msan_"));
+    EXPECT_TRUE(
+        absl::StrContains(serialized, "__xla_cpu_runtime_emutls_get_address"));
+
+    auto* cpu_aot_result =
+        absl::down_cast<CpuAotCompilationResult*>(aot_results[0].get());
+    std::vector<absl::string_view> features = absl::StrSplit(
+        cpu_aot_result->proto().target_machine_options().features(), ',');
+    if (test_case.expected_override.empty()) {
+      EXPECT_THAT(features, Not(Contains("-avx2")));
+      EXPECT_THAT(features, Not(Contains("-sve")));
+    } else {
+      EXPECT_THAT(features, Contains(test_case.expected_override));
+    }
+  }
+}
+
+TEST(CpuAotCompilationOptionsTest, SanitizeMemoryOptionsAreConsistent) {
+  CpuAotCompilationOptions options(
+      kTargetTripleForHost, kTargetCpuForHost, /*features=*/"",
+      /*entry_point_name=*/"entry",
+      CpuAotCompilationOptions::RelocationModel::BigPic);
+  EXPECT_FALSE(options.sanitize_memory());
+  EXPECT_EQ(options.sanitize_memory_track_origins(), 0);
+
+  options.set_sanitize_memory_track_origins(2);
+  EXPECT_TRUE(options.sanitize_memory());
+  EXPECT_EQ(options.sanitize_memory_track_origins(), 2);
+
+  options.set_sanitize_memory(false);
+  EXPECT_FALSE(options.sanitize_memory());
+  EXPECT_EQ(options.sanitize_memory_track_origins(), 0);
+
+  options.set_sanitize_memory(true);
+  EXPECT_TRUE(options.sanitize_memory());
+  EXPECT_EQ(options.sanitize_memory_track_origins(), 0);
 }
 
 TEST_F(CpuAotCompilerTest, ExportedExecutableDataLayoutIsNotEmpty) {
