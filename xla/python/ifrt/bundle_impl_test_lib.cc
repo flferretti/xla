@@ -47,12 +47,14 @@ namespace xla {
 namespace ifrt {
 namespace {
 
+using ::absl_testing::IsOk;
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::Each;
 using ::testing::ElementsAre;
 using ::testing::ElementsAreArray;
 using ::testing::IsEmpty;
+using ::testing::Not;
 using ::testing::SizeIs;
 
 absl::StatusOr<ArrayRef> MakeArbitrarySingleDeviceArray(Client* client) {
@@ -987,41 +989,18 @@ TEST(BundleImplTest, GetValuesWithAlwaysCopyFails) {
               StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
-TEST(BundleImplTest, EmptyBundleAndDeleteIfSupported) {
+TEST(BundleImplTest, EmptyBundleFails) {
   ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
 
-  absl::StatusOr<BundleRef> bundle =
-      client->Bundle({}, ArrayCopySemantics::kReuseInput);
-  if (absl::IsInvalidArgument(bundle.status())) {
-    GTEST_SKIP() << "Empty bundles are not supported.";
-  }
-  ASSERT_OK(bundle.status());
-
-  EXPECT_EQ((*bundle)->num_values(), 0);
-  EXPECT_OK((*bundle)->GetReadyFuture().Await());
-  EXPECT_THAT((*bundle)->GetValues(ArrayCopySemantics::kReuseInput),
-              IsOkAndHolds(IsEmpty()));
-  EXPECT_THAT((*bundle)->GetArraySpecs(), IsOkAndHolds(IsEmpty()));
-  EXPECT_FALSE((*bundle)->IsDeleted());
-  EXPECT_OK((*bundle)->Delete().Await());
-  EXPECT_TRUE((*bundle)->IsDeleted());
+  EXPECT_THAT(client->Bundle({}, ArrayCopySemantics::kReuseInput),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
-TEST(BundleImplTest, ConcatEmptyBundlesAndDeleteIfSupported) {
+TEST(BundleImplTest, ConcatEmptyBundlesFails) {
   ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
 
-  absl::StatusOr<BundleRef> bundle =
-      client->ConcatBundles({}, ArrayCopySemantics::kReuseInput);
-  if (absl::IsInvalidArgument(bundle.status())) {
-    GTEST_SKIP() << "Empty bundle concatenation is not supported.";
-  }
-  ASSERT_OK(bundle.status());
-
-  EXPECT_EQ((*bundle)->num_values(), 0);
-  EXPECT_OK((*bundle)->GetReadyFuture().Await());
-  EXPECT_FALSE((*bundle)->IsDeleted());
-  EXPECT_OK((*bundle)->Delete().Await());
-  EXPECT_TRUE((*bundle)->IsDeleted());
+  EXPECT_THAT(client->ConcatBundles({}, ArrayCopySemantics::kReuseInput),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(BundleImplTest, CopyArraysWithMismatchedCopySpecsSizeFails) {
@@ -1090,6 +1069,326 @@ TEST(BundleImplTest, ReshardArraysWithMismatchedArraySpecsSizeFails) {
   EXPECT_THAT(bundle->ReshardArrays(specs, ArrayCopySemantics::kDonateInput),
               StatusIs(absl::StatusCode::kInvalidArgument));
   EXPECT_FALSE(bundle->IsDeleted());
+}
+
+TEST(BundleImplTest, SliceWithZeroSliceSizeFails) {
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
+  ASSERT_OK_AND_ASSIGN(ArrayRef array0,
+                       MakeArbitrarySingleDeviceArray(client.get()));
+  ASSERT_OK_AND_ASSIGN(ArrayRef array1,
+                       MakeArbitrarySingleDeviceArray(client.get()));
+  std::vector<ValueRef> values = {array0, array1};
+  ASSERT_OK_AND_ASSIGN(
+      BundleRef bundle,
+      client->Bundle(absl::MakeSpan(values), ArrayCopySemantics::kReuseInput));
+
+  EXPECT_THAT(bundle->Slice({0, 2}, ArrayCopySemantics::kReuseInput),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(BundleImplTest, CopyArraysWithZeroSliceSizeFails) {
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
+  ASSERT_OK_AND_ASSIGN(ArrayRef array0,
+                       MakeArbitrarySingleDeviceArray(client.get()));
+  ASSERT_OK_AND_ASSIGN(ArrayRef array1,
+                       MakeArbitrarySingleDeviceArray(client.get()));
+  std::vector<ValueRef> values = {array0, array1};
+  ASSERT_OK_AND_ASSIGN(
+      BundleRef bundle,
+      client->Bundle(absl::MakeSpan(values), ArrayCopySemantics::kReuseInput));
+  std::vector<Bundle::CopySpec> specs = {Bundle::CopySpec{},
+                                         Bundle::CopySpec{}};
+
+  EXPECT_THAT(
+      bundle->CopyArrays({0, 2}, specs, ArrayCopySemantics::kReuseInput),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(BundleImplTest, BundleWithDonateInputMarksInputsDeleted) {
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
+  Device* const device = client->addressable_devices().at(0);
+  ShardingRef sharding = SingleDeviceSharding::Create(device, MemoryKind());
+  std::vector<float> data0 = {1.0f, 2.0f};
+  std::vector<float> data1 = {3.0f, 4.0f};
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected0,
+      client->MakeArrayFromHostBuffer(
+          data0.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected1,
+      client->MakeArrayFromHostBuffer(
+          data1.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+
+  BundleRef bundle;
+  {
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array0,
+        client->MakeArrayFromHostBuffer(
+            data0.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array1,
+        client->MakeArrayFromHostBuffer(
+            data1.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    std::vector<ValueRef> values = {array0, array1};
+
+    ASSERT_OK_AND_ASSIGN(bundle,
+                         client->Bundle(absl::MakeSpan(values),
+                                        ArrayCopySemantics::kDonateInput));
+    EXPECT_TRUE(array0->IsDeleted());
+    EXPECT_TRUE(array1->IsDeleted());
+    EXPECT_OK(array0->Delete().Await());
+  }
+
+  ASSERT_OK_AND_ASSIGN(std::vector<ValueRef> retrieved_values,
+                       bundle->GetValues(ArrayCopySemantics::kReuseInput));
+  ASSERT_THAT(retrieved_values, SizeIs(2));
+  CheckArrayContents(cast<Array>(retrieved_values[0].get()), expected0.get());
+  CheckArrayContents(cast<Array>(retrieved_values[1].get()), expected1.get());
+}
+
+TEST(BundleImplTest, ConcatBundlesWithDonateInputMarksBundlesDeleted) {
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
+  Device* const device = client->addressable_devices().at(0);
+  ShardingRef sharding = SingleDeviceSharding::Create(device, MemoryKind());
+  std::vector<float> data0 = {1.0f, 2.0f};
+  std::vector<float> data1 = {3.0f, 4.0f};
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected0,
+      client->MakeArrayFromHostBuffer(
+          data0.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected1,
+      client->MakeArrayFromHostBuffer(
+          data1.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+
+  BundleRef concat_bundle;
+  {
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array0,
+        client->MakeArrayFromHostBuffer(
+            data0.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array1,
+        client->MakeArrayFromHostBuffer(
+            data1.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    std::vector<ValueRef> values0 = {array0};
+    std::vector<ValueRef> values1 = {array1};
+    ASSERT_OK_AND_ASSIGN(BundleRef bundle0,
+                         client->Bundle(absl::MakeSpan(values0),
+                                        ArrayCopySemantics::kDonateInput));
+    ASSERT_OK_AND_ASSIGN(BundleRef bundle1,
+                         client->Bundle(absl::MakeSpan(values1),
+                                        ArrayCopySemantics::kDonateInput));
+    std::vector<BundleRef> bundles = {bundle0, bundle1};
+
+    ASSERT_OK_AND_ASSIGN(
+        concat_bundle, client->ConcatBundles(absl::MakeSpan(bundles),
+                                             ArrayCopySemantics::kDonateInput));
+    EXPECT_TRUE(bundle0->IsDeleted());
+    EXPECT_TRUE(bundle1->IsDeleted());
+    EXPECT_OK(bundle0->Delete().Await());
+  }
+
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<ValueRef> retrieved_values,
+      concat_bundle->GetValues(ArrayCopySemantics::kReuseInput));
+  ASSERT_THAT(retrieved_values, SizeIs(2));
+  CheckArrayContents(cast<Array>(retrieved_values[0].get()), expected0.get());
+  CheckArrayContents(cast<Array>(retrieved_values[1].get()), expected1.get());
+}
+
+TEST(BundleImplTest, GetValuesWithDonateInputMarksBundleDeleted) {
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
+  Device* const device = client->addressable_devices().at(0);
+  ShardingRef sharding = SingleDeviceSharding::Create(device, MemoryKind());
+  std::vector<float> data0 = {1.0f, 2.0f};
+  std::vector<float> data1 = {3.0f, 4.0f};
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected0,
+      client->MakeArrayFromHostBuffer(
+          data0.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected1,
+      client->MakeArrayFromHostBuffer(
+          data1.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+
+  std::vector<ValueRef> retrieved_values;
+  {
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array0,
+        client->MakeArrayFromHostBuffer(
+            data0.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array1,
+        client->MakeArrayFromHostBuffer(
+            data1.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    std::vector<ValueRef> values = {array0, array1};
+    ASSERT_OK_AND_ASSIGN(BundleRef bundle,
+                         client->Bundle(absl::MakeSpan(values),
+                                        ArrayCopySemantics::kDonateInput));
+
+    ASSERT_OK_AND_ASSIGN(retrieved_values,
+                         bundle->GetValues(ArrayCopySemantics::kDonateInput));
+    EXPECT_TRUE(bundle->IsDeleted());
+    EXPECT_OK(bundle->Delete().Await());
+  }
+
+  ASSERT_THAT(retrieved_values, SizeIs(2));
+  CheckArrayContents(cast<Array>(retrieved_values[0].get()), expected0.get());
+  CheckArrayContents(cast<Array>(retrieved_values[1].get()), expected1.get());
+}
+
+TEST(BundleImplTest, SliceWithDonateInputMarksBundleDeleted) {
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
+  Device* const device = client->addressable_devices().at(0);
+  ShardingRef sharding = SingleDeviceSharding::Create(device, MemoryKind());
+  std::vector<float> data0 = {1.0f, 2.0f};
+  std::vector<float> data1 = {3.0f, 4.0f};
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected0,
+      client->MakeArrayFromHostBuffer(
+          data0.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected1,
+      client->MakeArrayFromHostBuffer(
+          data1.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+
+  std::vector<BundleRef> slices;
+  {
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array0,
+        client->MakeArrayFromHostBuffer(
+            data0.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array1,
+        client->MakeArrayFromHostBuffer(
+            data1.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    std::vector<ValueRef> values = {array0, array1};
+    ASSERT_OK_AND_ASSIGN(BundleRef bundle,
+                         client->Bundle(absl::MakeSpan(values),
+                                        ArrayCopySemantics::kDonateInput));
+
+    ASSERT_OK_AND_ASSIGN(
+        slices, bundle->Slice({1, 1}, ArrayCopySemantics::kDonateInput));
+    EXPECT_TRUE(bundle->IsDeleted());
+    EXPECT_OK(bundle->Delete().Await());
+  }
+
+  ASSERT_THAT(slices, SizeIs(2));
+  ASSERT_OK_AND_ASSIGN(std::vector<ValueRef> values0,
+                       slices[0]->GetValues(ArrayCopySemantics::kReuseInput));
+  ASSERT_OK_AND_ASSIGN(std::vector<ValueRef> values1,
+                       slices[1]->GetValues(ArrayCopySemantics::kReuseInput));
+  ASSERT_THAT(values0, SizeIs(1));
+  ASSERT_THAT(values1, SizeIs(1));
+  CheckArrayContents(cast<Array>(values0[0].get()), expected0.get());
+  CheckArrayContents(cast<Array>(values1[0].get()), expected1.get());
+}
+
+TEST(BundleImplTest,
+     CopyArraysWithDonateInputPreservesOutputAfterSourceDestroyed) {
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
+  Device* const device = client->addressable_devices().at(0);
+  ShardingRef sharding = SingleDeviceSharding::Create(device, MemoryKind());
+  std::vector<float> data = {1.0f, 2.0f};
+  ASSERT_OK_AND_ASSIGN(
+      ArrayRef expected,
+      client->MakeArrayFromHostBuffer(
+          data.data(), DType(DType::kF32), Shape({2}),
+          /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+          Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+          /*host_buffer_hold=*/nullptr));
+
+  BundleRef copied_bundle;
+  {
+    ASSERT_OK_AND_ASSIGN(
+        ArrayRef array,
+        client->MakeArrayFromHostBuffer(
+            data.data(), DType(DType::kF32), Shape({2}),
+            /*byte_strides=*/std::nullopt, sharding, /*layout=*/nullptr,
+            Client::HostBufferSemantics::kImmutableOnlyDuringCall,
+            /*host_buffer_hold=*/nullptr));
+    std::vector<ValueRef> values = {array};
+    ASSERT_OK_AND_ASSIGN(BundleRef bundle,
+                         client->Bundle(absl::MakeSpan(values),
+                                        ArrayCopySemantics::kDonateInput));
+    std::vector<Bundle::CopySpec> specs = {Bundle::CopySpec{}};
+
+    ASSERT_OK_AND_ASSIGN(
+        copied_bundle,
+        bundle->CopyArrays({1}, specs, ArrayCopySemantics::kDonateInput));
+    EXPECT_TRUE(bundle->IsDeleted());
+    EXPECT_OK(bundle->Delete().Await());
+  }
+
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<ValueRef> copied_values,
+      copied_bundle->GetValues(ArrayCopySemantics::kReuseInput));
+  ASSERT_THAT(copied_values, SizeIs(1));
+  CheckArrayContents(cast<Array>(copied_values[0].get()), expected.get());
+}
+
+TEST(BundleImplTest, GetReadyFutureOnDeletedBundleFails) {
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<Client> client, test_util::GetClient());
+  ASSERT_OK_AND_ASSIGN(ArrayRef array,
+                       MakeArbitrarySingleDeviceArray(client.get()));
+  std::vector<ValueRef> values = {array};
+  ASSERT_OK_AND_ASSIGN(
+      BundleRef bundle,
+      client->Bundle(absl::MakeSpan(values), ArrayCopySemantics::kReuseInput));
+  ASSERT_OK(bundle->GetReadyFuture().Await());
+
+  ASSERT_OK(bundle->Delete().Await());
+
+  EXPECT_THAT(bundle->GetReadyFuture().Await(), Not(IsOk()));
 }
 
 }  // namespace
