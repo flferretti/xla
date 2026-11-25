@@ -1,0 +1,28 @@
+// RUN: gpu_fusion_to_mlir %s | emitters_opt -xla-test-optimize | FileCheck %s
+// RUN: gpu_test_correctness %s
+
+fusion {
+  %p0 = f16[1,1048576] parameter(0)
+  %p1 = f16[1,1048576] parameter(1)
+  %concat = f16[2,1048576] concatenate(%p0, %p1), dimensions={0}
+  %p2 = f16[] parameter(2)
+  %b = f16[2,1048576] broadcast(%p2), dimensions={}
+  ROOT %mul = f16[2,1048576] multiply(%concat, %b)
+}
+
+ENTRY main {
+  %p0 = f16[1,1048576] parameter(0)
+  %p1 = f16[1,1048576] parameter(1)
+  %p2 = f16[] parameter(2)
+  ROOT %fusion = f16[2,1048576] fusion(%p0, %p1, %p2),
+      kind=kInput, calls=fusion
+}
+
+// The concatenate dimension has size 1, but each operand contributes 1048576
+// contiguous elements, so the loop is still unrolled (and later vectorized).
+
+// CHECK-DAG: #[[MAP0:.*]] = #xla.indexing_map<"(th_x, bl_x)[s0] -> (0, th_x * 4 + bl_x * 512 + s0)
+// CHECK-DAG: #[[MAP1:.*]] = #xla.indexing_map<"(th_x, bl_x)[s0] -> (1, th_x * 4 + bl_x * 512 + s0)
+// CHECK-LABEL: func.func @main(
+// CHECK:         xla.loop {{.*}} in #[[MAP0]]
+// CHECK:         xla.loop {{.*}} in #[[MAP1]]

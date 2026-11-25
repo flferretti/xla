@@ -1,0 +1,19 @@
+// RUN: gpu_fusion_to_mlir %s | emitters_opt -xla-test-optimize | FileCheck %s
+// RUN: gpu_test_correctness %s
+
+fusion {
+  %p0 = f32[262142,2] parameter(0)
+  %p1 = f32[131074,2] parameter(1)
+  ROOT %concat = f32[393216,2] concatenate(%p0, %p1), dimensions={0}
+}
+
+ENTRY main {
+  %p0 = f32[262142,2] parameter(0)
+  %p1 = f32[131074,2] parameter(1)
+  ROOT %fusion = f32[393216,2] fusion(%p0, %p1), kind=kInput, calls=fusion
+}
+
+// The unroll factor (4) is larger than the minor dimension (2), so each work
+// item covers two rows of the same operand.
+
+// CHECK: #xla.indexing_map<"(th_x, bl_x)[s0] -> ({{.*}}), domain: {{.*}} s0 in [0, 3]
