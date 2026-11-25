@@ -87,7 +87,7 @@ class Array : public RTTIExtends<Array, Value> {
   // assumed to have the same layout. `nullptr` indicates a default layout; the
   // user can obtain a concrete layout by calling
   // `Client::GetDefaultPjRtLayout()`.
-  virtual absl::StatusOr<std::shared_ptr<const xla::PjRtLayout>> pjrt_layout()
+  virtual absl_nullable std::shared_ptr<const xla::PjRtLayout> pjrt_layout()
       const = 0;
   virtual LayoutRef layout() const = 0;
 

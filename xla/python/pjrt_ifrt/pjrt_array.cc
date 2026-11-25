@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -727,7 +728,7 @@ bool PjRtArray::IsDeleted() const {
 std::string PjRtArray::DebugString() const {
   absl::StatusOr<std::shared_ptr<const xla::PjRtLayout>> layout_ptr =
       pjrt_layout();
-  if (layout_ptr.ok() && *layout_ptr == nullptr) {
+  if (*layout_ptr == nullptr) {
     layout_ptr =
         [&]() -> absl::StatusOr<std::shared_ptr<const xla::PjRtLayout>> {
       ABSL_ASSIGN_OR_RETURN(
@@ -753,7 +754,7 @@ std::string PjRtArray::DebugString() const {
       array_spec_.sharding, layout_str);
 }
 
-absl::StatusOr<std::shared_ptr<const xla::PjRtLayout>> PjRtArray::pjrt_layout()
+absl_nullable std::shared_ptr<const xla::PjRtLayout> PjRtArray::pjrt_layout()
     const {
   if constexpr (tsl::kIsDebugBuild) {
     if (!IsDeleted()) {
