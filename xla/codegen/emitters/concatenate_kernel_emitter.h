@@ -65,8 +65,11 @@ class ConcatenateFusionKernelEmitter final
 
   // Get the maximum valid unroll factor for the given fusion spec and maximum
   // unroll factor.
-  // For concatenate, this is the greatest common divisor of the concatenate
-  // dimension of all operands.
+  // For concatenate, the unroll factor must divide the size of the concatenate
+  // dimension of all operands. If the dimensions more minor than the
+  // concatenate dimension are unrolled too, it must divide the number of
+  // contiguous elements of each operand instead, and is limited to one 128-bit
+  // vector.
   static int GetValidUnrollFactor(const HloFusionSpec& fusion_spec,
                                   int max_unroll_factor);
 

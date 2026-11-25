@@ -156,15 +156,31 @@ const Shape& ConcatenateFusionKernelEmitter::GetIndexingShape(
 int ConcatenateFusionKernelEmitter::GetValidUnrollFactor(
     const HloFusionSpec& fusion_spec, int max_unroll_factor) {
   auto& concat = fusion_spec.fusion_hero(0).instruction();
-  int unroll_factor = max_unroll_factor;
   int64_t dim = concat.concatenate_dimension();
-  for (const HloInstruction* operand : concat.operands()) {
-    if (unroll_factor == 1) {
-      return 1;
+  // Number of consecutive elements (in the indexing shape's layout) that share
+  // the same index along the concatenate dimension.
+  const Shape& indexing_shape = GetIndexingShape(fusion_spec);
+  int64_t stride = 1;
+  for (int64_t minor_dim : LayoutUtil::MinorToMajor(indexing_shape)) {
+    if (minor_dim == dim) {
+      break;
     }
-    unroll_factor = std::gcd(unroll_factor, operand->shape().dimensions(dim));
+    stride *= indexing_shape.dimensions(minor_dim);
   }
-  return unroll_factor;
+  int64_t unroll_factor = max_unroll_factor;
+  int64_t contiguous_unroll_factor = max_unroll_factor;
+  for (const HloInstruction* operand : concat.operands()) {
+    unroll_factor = std::gcd(unroll_factor, operand->shape().dimensions(dim));
+    contiguous_unroll_factor = std::gcd(
+        contiguous_unroll_factor, operand->shape().dimensions(dim) * stride);
+  }
+  // Unrolling over the more minor dimensions only helps by enabling vector
+  // accesses, so limit it to one 128-bit vector. Wider unrolling made f64
+  // concatenates slower on A100.
+  int64_t max_vector_unroll_factor = std::max<int64_t>(
+      1, 128 / primitive_util::StorageBitWidth(concat.shape().element_type()));
+  return std::max(unroll_factor,
+                  std::gcd(contiguous_unroll_factor, max_vector_unroll_factor));
 }
 
 bool ConcatenateFusionKernelEmitter::CanEmitFastCpuCopy(

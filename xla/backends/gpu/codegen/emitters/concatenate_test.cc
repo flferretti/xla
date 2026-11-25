@@ -21,6 +21,7 @@
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/service/gpu/gpu_device_info_for_tests.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
@@ -57,6 +58,38 @@ TEST_F(ConcatenateFusionTest, PropagatesUnrollFactorToCompilationPipeline) {
 
   // Blackwell with CUDA 12.9 vectorizes up to 256 bits, or 16 BF16 elements.
   EXPECT_EQ(compilation_pipeline_emitter.unroll_factor(), 16);
+}
+
+int UnrollFactorForConcatenate(const HloModule& module) {
+  se::DeviceDescription device_info = TestGpuDeviceInfo::B200SXMDeviceInfo();
+  device_info.set_compile_time_toolkit_version(se::SemanticVersion(12, 9, 0));
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *module.entry_computation()->root_instruction(), device_info);
+  ConcatenateFusion concatenate_fusion(analysis);
+  return static_cast<const MlirKernelEmitter&>(concatenate_fusion)
+      .unroll_factor();
+}
+
+TEST_F(ConcatenateFusionTest, UnrollsAlongMinorDimsOfNonMinorConcat) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
+    ENTRY main {
+      p0 = bf16[1,1024000] parameter(0)
+      p1 = bf16[1,1024000] parameter(1)
+      ROOT result = bf16[2,1024000] concatenate(p0, p1), dimensions={0}
+    })"));
+  // Limited to one 128-bit vector, or 8 BF16 elements.
+  EXPECT_EQ(UnrollFactorForConcatenate(*module), 8);
+}
+
+TEST_F(ConcatenateFusionTest, NonMinorConcatUnrollDividesOperandSlices) {
+  // 1024004 = 4 * 256001, so each operand slice is only divisible by 4.
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
+    ENTRY main {
+      p0 = bf16[1,1024004] parameter(0)
+      p1 = bf16[1,1024004] parameter(1)
+      ROOT result = bf16[2,1024004] concatenate(p0, p1), dimensions={0}
+    })"));
+  EXPECT_EQ(UnrollFactorForConcatenate(*module), 4);
 }
 
 }  // namespace
