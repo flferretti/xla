@@ -1,0 +1,29 @@
+// RUN: gpu_fusion_to_mlir %s | FileCheck %s
+// RUN: gpu_test_correctness %s
+
+add {
+  %p0 = f32[] parameter(0)
+  %p1 = f32[] parameter(1)
+  ROOT %sum = f32[] add(%p0, %p1)
+}
+scatter {
+  %operand = f32[16] parameter(0)
+  %indices = s32[16384,1] parameter(1)
+  %update = f32[16384,1] parameter(2)
+
+  ROOT %scatter = f32[16] scatter(
+      f32[16] %operand,
+      s32[16384,1] %indices,
+      f32[16384,1] %update
+    ),
+    update_window_dims={1},
+    inserted_window_dims={},
+    scatter_dims_to_operand_dims={0},
+    index_vector_dim=1,
+    indices_are_sorted=true,
+    unique_indices=false,
+    to_apply=add
+}
+// The serial loop over indices is spread over more warps than the minimum of
+// 4 warps per core, while keeping 32 indices per warp.
+// CHECK: bl_x in [0, 127], {{.*}}index_id_loop in [0, 7], index_vector_id in [0, 3]
