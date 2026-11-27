@@ -1003,9 +1003,17 @@ std::unique_ptr<ScatterFusion> CreateScatterFusion(
     // of the number of the given updates to the number of the possible valid
     // indices. If we do not have multiple updates per warp, there is no reason
     // to use this algorithm.
+    // Each warp loops over its indices serially, so spread them over as many
+    // warps as can be resident, while keeping at least `warp_size` indices per
+    // warp so that runs of equal indices are still accumulated in registers.
+    int64_t resident_warps = analysis.device_info().core_count() *
+                             analysis.device_info().threads_per_core_limit() /
+                             warp_size;
+    int64_t num_warps = std::max(
+        max_active_warps, std::min(num_slices / warp_size, resident_warps));
     num_indices_per_warp = CeilOfRatio(
         num_slices,
-        std::max(max_active_warps,
+        std::max(num_warps,
                  GetNumPossibleValidIndices(description.slice_shape,
                                             description.output_shape,
                                             description.index_vector_length)));
